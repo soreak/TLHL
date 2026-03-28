@@ -23,7 +23,7 @@
 ## 使用方式
 
 ```python
-from two_layer_hnsw_like_virtual_seed import TwoLayerHNSWLikeIndex
+from two_layer_hnsw_like import TwoLayerHNSWLikeIndex
 
 index = TwoLayerHNSWLikeIndex(
     n_centers=32,

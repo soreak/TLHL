@@ -5,12 +5,12 @@ ROOT = Path(__file__).parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
-    name="two-layer-hnsw-like",
+    name="TLHL",
     version="0.1.0",
     description="Two-layer HNSW-like ANN index",
     long_description=README,
     long_description_content_type="text/markdown",
-    author="Your Name",
+    author="czh",
     packages=find_packages(exclude=("tests", "tests.*")),
     include_package_data=False,
     package_data={},
@@ -21,5 +21,6 @@ setup(
     install_requires=[
         "numpy",
         "scikit-learn",
+        "faiss-cpu==1.7.4",
     ],
 )
