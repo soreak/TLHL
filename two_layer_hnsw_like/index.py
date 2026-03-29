@@ -202,18 +202,21 @@ class TwoLayerHNSWLikeIndex:
         if ef is None:
             ef = max(self.params.ef_construction, k * 4)
 
+        # center_dists = np.sum((self.centers - query) ** 2, axis=1)
+        # probe_count = max(1, min(n_probe_centers, len(self.centers)))
+        # probe_ids = np.argsort(center_dists)[:probe_count]
         center_dists = np.sum((self.centers - query) ** 2, axis=1)
         probe_count = max(1, min(n_probe_centers, len(self.centers)))
-        probe_ids = np.argsort(center_dists)[:probe_count]
+        probe_ids = np.argpartition(center_dists, probe_count - 1)[:probe_count]
+        probe_ids = probe_ids[np.argsort(center_dists[probe_ids])]
 
         entry_points: List[int] = [int(cid) for cid in probe_ids]
         if self.base_entry is not None and self.base_entry not in entry_points:
             entry_points.append(self.base_entry)
 
-        ef_internal = min(
-            max(ef, k) + self.virtual_base_count,
-            len(self.base_vectors),
-        )
+        #ef_internal = min(max(ef, k) + self.virtual_base_count,len(self.base_vectors))
+        extra = min(100, self.virtual_base_count)
+        ef_internal = min(max(ef, k) + extra, len(self.base_vectors))
         cand = search_layer(
             query=query,
             entry_points=entry_points,
