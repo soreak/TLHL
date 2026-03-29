@@ -22,6 +22,5 @@ setup(
         "numpy",
         "scikit-learn",
         "faiss-cpu==1.7.4",
-        "numba",
     ],
 )
