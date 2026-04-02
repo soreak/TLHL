@@ -1,6 +1,118 @@
+from __future__ import annotations
 import numpy as np
 import faiss
 
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class _RouterNode:
+    center_ids: np.ndarray
+    normal: Optional[np.ndarray] = None
+    bias: float = 0.0
+    left: Optional["_RouterNode"] = None
+    right: Optional["_RouterNode"] = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.left is None and self.right is None
+
+
+class CenterHyperplaneRouter:
+    """
+    用中心点构建一棵二分超平面路由树。
+
+    每个内部节点保存一个超平面：
+        score(x) = dot(normal, x) + bias
+    score <= 0 -> left
+    score >  0 -> right
+
+    叶子节点保存一个中心 id。
+    """
+
+    def __init__(self, centers: np.ndarray):
+        self.centers = np.asarray(centers, dtype=np.float32, order="C")
+        if self.centers.ndim != 2:
+            raise ValueError("centers 必须是二维矩阵")
+        K = self.centers.shape[0]
+        if K == 0:
+            raise ValueError("centers 不能为空")
+
+        ids = np.arange(K, dtype=np.int32)
+        self.root = self._build(ids)
+
+    def _build(self, ids: np.ndarray) -> _RouterNode:
+        ids = np.asarray(ids, dtype=np.int32)
+        if ids.size == 1:
+            return _RouterNode(center_ids=ids.copy())
+
+        C = self.centers[ids]
+        mean = C.mean(axis=0, dtype=np.float32)
+        centered = C - mean[None, :]
+
+        direction = None
+        if centered.shape[0] >= 2:
+            try:
+                _, s, vt = np.linalg.svd(centered, full_matrices=False)
+                if s.size > 0 and float(s[0]) > 1e-8:
+                    direction = vt[0].astype(np.float32, copy=False)
+            except np.linalg.LinAlgError:
+                direction = None
+
+        if direction is None:
+            var = C.var(axis=0)
+            direction = np.zeros(C.shape[1], dtype=np.float32)
+            direction[int(np.argmax(var))] = 1.0
+
+        proj = C @ direction
+        order = np.argsort(proj, kind="mergesort")
+
+        mid = ids.size // 2
+        left_ids = ids[order[:mid]]
+        right_ids = ids[order[mid:]]
+
+        if left_ids.size == 0 or right_ids.size == 0:
+            half = max(1, ids.size // 2)
+            left_ids = ids[:half]
+            right_ids = ids[half:]
+
+        left_mean = self.centers[left_ids].mean(axis=0, dtype=np.float32)
+        right_mean = self.centers[right_ids].mean(axis=0, dtype=np.float32)
+
+        normal = (right_mean - left_mean).astype(np.float32, copy=False)
+        norm = float(np.linalg.norm(normal))
+
+        if norm > 1e-8:
+            midpoint = 0.5 * (left_mean + right_mean)
+            bias = -float(np.dot(normal, midpoint))
+        else:
+            normal = direction.astype(np.float32, copy=False)
+            threshold = float(np.median(proj))
+            bias = -threshold
+
+        return _RouterNode(
+            center_ids=ids.copy(),
+            normal=normal,
+            bias=bias,
+            left=self._build(left_ids),
+            right=self._build(right_ids),
+        )
+
+    def route(self, x: np.ndarray) -> int:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        node = self.root
+        while not node.is_leaf:
+            score = float(np.dot(node.normal, x) + node.bias)
+            node = node.left if score <= 0.0 else node.right
+        return int(node.center_ids[0])
+
+    def route_many(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32, order="C")
+        out = np.empty((X.shape[0],), dtype=np.int32)
+        for i in range(X.shape[0]):
+            out[i] = self.route(X[i])
+        return out
 
 class CPD_KMeans:
     """
@@ -51,6 +163,7 @@ class CPD_KMeans:
 
         self.n = self.data.shape[0]
         self._assign_index = faiss.IndexFlatL2(self.m)
+        self.router_: CenterHyperplaneRouter | None = None
 
     def init_cluster_center(self) -> np.ndarray:
         X = self.data
@@ -285,4 +398,5 @@ class CPD_KMeans:
 
         self.centers = centers.astype(np.float32, copy=False)
         self.labels_ = self.assign_clusters(self.centers, self.data_full)
+        self.router_ = CenterHyperplaneRouter(self.centers)
         return self.centers, self.labels_

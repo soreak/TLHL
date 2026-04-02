@@ -8,9 +8,10 @@ from sklearn.cluster import KMeans
 
 from .base_layer import build_base_layer
 from .center_layer import build_center_layer
-from .distance import l2_sq, to_float32_matrix
-from .graph_search import search_layer
+# from .distance import l2_sq, to_float32_matrix
+from .distance import to_float32_matrix, HAS_NUMBA
 
+from .graph_search import search_layer
 
 @dataclass
 class IndexParams:
@@ -109,9 +110,12 @@ class TwoLayerHNSWLikeIndex:
 
         self.base_entry: Optional[int] = None
         self.virtual_base_count: int = 0
+        self.center_router = None
+
+        self.center_sq_norms: Optional[np.ndarray] = None
+        self.base_sq_norms: Optional[np.ndarray] = None
 
     def _cluster_points(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Cluster X into balanced virtual centers."""
         if self.params.cluster_method == "kmeans":
             kmeans = KMeans(
                 n_clusters=self.params.n_centers,
@@ -122,9 +126,12 @@ class TwoLayerHNSWLikeIndex:
             )
             labels = kmeans.fit_predict(X)
             centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
+
+            from .CPD_Kmeans_old import CenterHyperplaneRouter
+            self.center_router = CenterHyperplaneRouter(centers)
+
             return centers, labels.astype(np.int32, copy=False)
 
-        # default: CPD_KMeans balanced clustering
         from .CPD_Kmeans_old import CPD_KMeans
 
         cpd = CPD_KMeans(
@@ -142,10 +149,13 @@ class TwoLayerHNSWLikeIndex:
         centers, labels = cpd.train()
         centers = np.asarray(centers, dtype=np.float32, order="C")
         labels = np.asarray(labels, dtype=np.int32)
+
         if centers.shape[0] != self.params.n_centers:
             raise ValueError("CPD_KMeans 返回的 center 数量与 n_centers 不一致")
         if labels.shape[0] != X.shape[0]:
             raise ValueError("CPD_KMeans 返回的 labels 长度与样本数不一致")
+
+        self.center_router = cpd.router_
         return centers, labels
 
     def fit(self, X: np.ndarray) -> "TwoLayerHNSWLikeIndex":
@@ -171,8 +181,13 @@ class TwoLayerHNSWLikeIndex:
         self.base_vectors = np.ascontiguousarray(
             np.vstack([self.centers, self.data_vectors]).astype(np.float32)
         )
+        self.center_sq_norms = np.sum(self.centers * self.centers, axis=1, dtype=np.float32)
+        self.base_sq_norms = np.sum(self.base_vectors * self.base_vectors, axis=1, dtype=np.float32)
 
-        insertion_entry_points = [int(label) for label in self.labels_]
+        if self.center_router is not None:
+            insertion_entry_points = self.center_router.route_many(self.data_vectors).tolist()
+        else:
+            insertion_entry_points = [int(label) for label in self.labels_]
         self.base_adj, self.base_entry = build_base_layer(
             base_vectors=self.base_vectors,
             m=self.params.m,
@@ -185,12 +200,40 @@ class TwoLayerHNSWLikeIndex:
 
         return self
 
+    def _row_l2_sq(
+            self,
+            query: np.ndarray,
+            matrix: np.ndarray,
+            sq_norms: np.ndarray,
+            ids: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        向量化计算 query 到若干行向量的 squared L2 distance。
+
+        dist(q, x) = ||q||^2 + ||x||^2 - 2 q·x
+        """
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        q_norm = np.float32(np.dot(q, q))
+
+        if ids is None:
+            dots = matrix @ q
+            dists = sq_norms + q_norm - np.float32(2.0) * dots
+        else:
+            rows = matrix[ids]
+            dots = rows @ q
+            dists = sq_norms[ids] + q_norm - np.float32(2.0) * dots
+
+        # 数值误差下可能略小于 0
+        np.maximum(dists, 0.0, out=dists)
+        return dists.astype(np.float32, copy=False)
+
+
     def search(
-        self,
-        query: np.ndarray,
-        k: int = 10,
-        ef: Optional[int] = None,
-        n_probe_centers: int = 1,
+            self,
+            query: np.ndarray,
+            k: int = 10,
+            ef: Optional[int] = None,
+            n_probe_centers: int = 1,
     ) -> List[Tuple[int, float]]:
         if self.base_vectors is None or self.centers is None or self.data_vectors is None:
             raise RuntimeError("请先 fit()")
@@ -202,21 +245,44 @@ class TwoLayerHNSWLikeIndex:
         if ef is None:
             ef = max(self.params.ef_construction, k * 4)
 
-        # center_dists = np.sum((self.centers - query) ** 2, axis=1)
-        # probe_count = max(1, min(n_probe_centers, len(self.centers)))
-        # probe_ids = np.argsort(center_dists)[:probe_count]
-        center_dists = np.sum((self.centers - query) ** 2, axis=1)
         probe_count = max(1, min(n_probe_centers, len(self.centers)))
-        probe_ids = np.argpartition(center_dists, probe_count - 1)[:probe_count]
-        probe_ids = probe_ids[np.argsort(center_dists[probe_ids])]
+
+        # 先通过二分树路由到一个中心
+        if self.center_router is not None:
+            routed_center = int(self.center_router.route(query))
+        else:
+            center_dists = self._row_l2_sq(query, self.centers, self.center_sq_norms)
+            routed_center = int(np.argmin(center_dists))
+
+        # 如果只要 1 个中心入口，直接用路由结果
+        if probe_count == 1 or not self.center_adj:
+            probe_ids = np.array([routed_center], dtype=np.int32)
+        else:
+            center_probe_ef = max(probe_count, min(16, len(self.centers)))
+            center_cand = search_layer(
+                query=query,
+                entry_points=[routed_center],
+                vectors=self.centers,
+                adj=self.center_adj,
+                ef=center_probe_ef,
+            )
+
+            if not center_cand:
+                probe_ids = np.array([routed_center], dtype=np.int32)
+            else:
+                center_cand = center_cand[: max(probe_count, 4)]
+                center_cand_arr = np.asarray(center_cand, dtype=np.int32)
+                d = self._row_l2_sq(query, self.centers, self.center_sq_norms, ids=center_cand_arr)
+                order = np.argsort(d)
+                probe_ids = center_cand_arr[order[:probe_count]]
 
         entry_points: List[int] = [int(cid) for cid in probe_ids]
         if self.base_entry is not None and self.base_entry not in entry_points:
             entry_points.append(self.base_entry)
 
-        #ef_internal = min(max(ef, k) + self.virtual_base_count,len(self.base_vectors))
         extra = min(100, self.virtual_base_count)
         ef_internal = min(max(ef, k) + extra, len(self.base_vectors))
+
         cand = search_layer(
             query=query,
             entry_points=entry_points,
@@ -229,12 +295,29 @@ class TwoLayerHNSWLikeIndex:
             cand = list(range(self.virtual_base_count, len(self.base_vectors)))
 
         filtered = [idx for idx in cand if idx >= self.virtual_base_count]
-        result = [
-            (idx - self.virtual_base_count, l2_sq(query, self.base_vectors[idx]))
-            for idx in filtered
+        if not filtered:
+            return []
+
+        filtered_ids = np.asarray(filtered, dtype=np.int32)
+        dists = self._row_l2_sq(
+            query=query,
+            matrix=self.base_vectors,
+            sq_norms=self.base_sq_norms,
+            ids=filtered_ids,
+        )
+
+        topk = min(k, filtered_ids.shape[0])
+        sel = np.argpartition(dists, topk - 1)[:topk]
+        sel = sel[np.argsort(dists[sel])]
+
+        final_ids = filtered_ids[sel] - self.virtual_base_count
+        final_dists = dists[sel]
+
+        return [
+            (int(idx), float(dist))
+            for idx, dist in zip(final_ids, final_dists)
         ]
-        result.sort(key=lambda x: x[1])
-        return result[:k]
+
 
     def summary(self) -> dict:
         graph_n = 0 if self.base_vectors is None else int(len(self.base_vectors))
@@ -273,4 +356,5 @@ class TwoLayerHNSWLikeIndex:
             "avg_center_degree": float(np.mean([len(x) for x in self.center_adj])) if self.center_adj else 0.0,
             "avg_virtual_base_degree": avg_virtual_degree,
             "avg_real_base_degree": avg_real_degree,
+            "numba_distance": bool(HAS_NUMBA),
         }
